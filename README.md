@@ -8,7 +8,7 @@ sdk_version: "4.44.0"
 app_file: app.py
 pinned: false
 license: mit
-short_description: Busca PubMed + detecção de vínculos corporativos em afiliações
+short_description: PubMed search + corporate affiliation detection
 ---
 
 # 🔬 Recoorpsearch
