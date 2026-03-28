@@ -19,6 +19,17 @@ def fetch_metadata(
     batch_size: int = 100,
     verbose: bool = True,
 ) -> list[dict]:
+    """
+    Fetch full metadata for a list of PMIDs via NCBI efetch (XML).
+
+    Returns a list of flat record dicts, one entry per author × article pair,
+    ready for DataFrame construction.
+
+    Fields per record:
+        pmid, doi, title, journal, pub_year, pub_month,
+        author_name, author_affiliation, corporate_flag,
+        coi_statement, funding_sources, abstract, pubmed_url
+    """
     if not pmids:
         return []
 
@@ -41,6 +52,8 @@ def fetch_metadata(
 
     return records
 
+
+# ─── XML parsing ──────────────────────────────────────────────────────────────
 
 def _parse_pubmed_xml(xml_bytes: bytes) -> list[dict]:
     root = etree.fromstring(xml_bytes)
@@ -69,18 +82,22 @@ def _extract_article_base(article) -> dict:
     abstract_parts = art.findall(".//AbstractText") if art is not None else []
     abstract = " ".join(_full_text(a) for a in abstract_parts)
 
+    # Publication date
     pub_date = art.find(".//PubDate") if art is not None else None
     pub_year = _text(pub_date, "Year") if pub_date is not None else ""
     pub_month = _text(pub_date, "Month") if pub_date is not None else ""
 
+    # DOI
     doi = ""
     for id_el in article.findall(".//ArticleId"):
         if id_el.get("IdType") == "doi":
-            doi = (id_el.text or "").strip()
+            doi = _sanitize((id_el.text or "").strip())
             break
 
+    # CoI statement
     coi = _text(medline, "CoiStatement") if medline is not None else ""
 
+    # Funding / grants
     grants = []
     for grant in article.findall(".//Grant"):
         agency = _text(grant, "Agency")
@@ -114,7 +131,7 @@ def _extract_authors(article) -> list[dict]:
 
         affiliations = []
         for aff in author_el.findall(".//AffiliationInfo/Affiliation"):
-            txt = (aff.text or "").strip()
+            txt = _sanitize((aff.text or "").strip())
             if txt:
                 affiliations.append(txt)
         affiliation_str = " | ".join(affiliations)
@@ -122,9 +139,26 @@ def _extract_authors(article) -> list[dict]:
         authors.append({
             "author_name": name,
             "author_affiliation": affiliation_str,
-            "corporate_flag": False,
+            "corporate_flag": False,  # populated later by affiliations.py
         })
     return authors
+
+
+# ─── utils ────────────────────────────────────────────────────────────────────
+
+def _sanitize(text: str) -> str:
+    """Remove lone surrogate characters that are invalid in UTF-8.
+
+    PubMed XML occasionally contains characters that lxml decodes as lone
+    surrogates (U+D800–U+DFFF). These are valid in Python's internal
+    representation (PEP 383 / surrogateescape) but break UTF-8 serializers
+    such as orjson (used by Gradio/FastAPI), causing:
+        UnicodeEncodeError: surrogates not allowed
+    Encoding with errors='replace' replaces them with U+FFFD (replacement char).
+    """
+    if not text:
+        return text
+    return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _text(el, xpath: str) -> str:
@@ -133,10 +167,11 @@ def _text(el, xpath: str) -> str:
     found = el.find(xpath)
     if found is None:
         return ""
-    return (found.text or "").strip()
+    return _sanitize((found.text or "").strip())
 
 
 def _full_text(el) -> str:
+    """Concatenate text + tail recursively (handles mixed-content XML)."""
     parts = []
     if el.text:
         parts.append(el.text)
@@ -144,7 +179,7 @@ def _full_text(el) -> str:
         parts.append(_full_text(child))
         if child.tail:
             parts.append(child.tail)
-    return "".join(parts).strip()
+    return _sanitize("".join(parts).strip())
 
 
 def _efetch_batch(pmids: list[str], api_key: Optional[str]) -> bytes:

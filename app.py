@@ -11,6 +11,47 @@ from typing import Optional
 import gradio as gr
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Patch: sanitizar lone surrogates antes do orjson serializar qualquer resposta
+#
+# O orjson (usado pelo Gradio/FastAPI) rejeita strings com caracteres surrogate
+# (U+D800–U+DFFF), que podem aparecer em dados do PubMed ou em strings
+# de sistema no Python 3.13, causando:
+#   TypeError: str is not valid UTF-8: surrogates not allowed
+#
+# A solução é interceptar o ORJSONResponse do Gradio e sanitizar recursivamente
+# todo o conteúdo antes de passar pro orjson — tanto no get_config (startup)
+# quanto em qualquer resposta de runtime.
+# ---------------------------------------------------------------------------
+def _deep_sanitize(obj):
+    """Substitui recursivamente lone surrogates por U+FFFD em qualquer objeto."""
+    if isinstance(obj, str):
+        return obj.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(obj, dict):
+        return {_deep_sanitize(k): _deep_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_deep_sanitize(i) for i in obj)
+    return obj
+
+
+try:
+    import orjson
+    import gradio.routes as _gr_routes
+
+    class _SafeORJSONResponse(_gr_routes.ORJSONResponse):
+        @classmethod
+        def _render(cls, content):
+            return orjson.dumps(
+                _deep_sanitize(content),
+                option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_PASSTHROUGH_DATETIME,
+                default=_gr_routes.ORJSONResponse.default,
+            )
+
+    _gr_routes.ORJSONResponse = _SafeORJSONResponse
+except Exception:
+    pass  # Se o Gradio mudar sua estrutura interna, falha silenciosa
+# ---------------------------------------------------------------------------
+
 from recoorpsearch.pipeline import run_pipeline
 from affiliation_agent import run_agent, build_summary
 
@@ -42,7 +83,7 @@ def _to_excel_bytes(df: pd.DataFrame, query: str = "") -> bytes:
         # Summary sheet (only when agent has run)
         if "veredicto_afiliacao" in df.columns:
             from affiliation_agent import KNOWN_COMPANIES
-            confirmed = df[df["veredicto_afiliacao"] == "\u2705 CONFIRMADO"]
+            confirmed = df[df["veredicto_afiliacao"] == "✅ CONFIRMADO"]
             rows = []
             for company in KNOWN_COMPANIES:
                 mask = confirmed.apply(
@@ -57,10 +98,10 @@ def _to_excel_bytes(df: pd.DataFrame, query: str = "") -> bytes:
                     sub = confirmed[mask]
                     rows.append({
                         "Empresa":      company,
-                        "N\u00ba Autores":   sub["author_name"].nunique() if "author_name" in sub.columns else "-",
-                        "N\u00ba Artigos":   sub["pmid"].nunique() if "pmid" in sub.columns else "-",
-                        "Peri\u00f3dicos":   ", ".join(sub["journal"].dropna().unique()[:3]) if "journal" in sub.columns else "-",
-                        "Per\u00edodo":      f"{sub['pub_year'].min()}\u2013{sub['pub_year'].max()}" if "pub_year" in sub.columns else "-",
+                        "Nº Autores":   sub["author_name"].nunique() if "author_name" in sub.columns else "-",
+                        "Nº Artigos":   sub["pmid"].nunique() if "pmid" in sub.columns else "-",
+                        "Periódicos":   ", ".join(sub["journal"].dropna().unique()[:3]) if "journal" in sub.columns else "-",
+                        "Período":      f"{sub['pub_year'].min()}–{sub['pub_year'].max()}" if "pub_year" in sub.columns else "-",
                     })
             if rows:
                 pd.DataFrame(rows).to_excel(writer, sheet_name="Resumo por Empresa", index=False)
@@ -69,18 +110,17 @@ def _to_excel_bytes(df: pd.DataFrame, query: str = "") -> bytes:
             "Query":           query,
             "Data da busca":   datetime.date.today().isoformat(),
             "Total de linhas": len(df),
-            "Artigos \u00fanicos":  df["pmid"].nunique() if "pmid" in df.columns else "-",
-        }]).to_excel(writer, sheet_name="Par\u00e2metros", index=False)
+            "Artigos únicos":  df["pmid"].nunique() if "pmid" in df.columns else "-",
+        }]).to_excel(writer, sheet_name="Parâmetros", index=False)
 
     return buf.getvalue()
-
-
-import re  # noqa: E402
 
 
 def _slug(text: str, max_len: int = 35) -> str:
     return re.sub(r"[^\w]", "_", text[:max_len])
 
+
+import re  # noqa: E402 (imported at top for _slug)
 
 # ---------------------------------------------------------------------------
 # Step 1 — PubMed search
@@ -88,7 +128,7 @@ def _slug(text: str, max_len: int = 35) -> str:
 
 def do_search(query: str, max_results: int, date_from: str, date_to: str):
     if not query.strip():
-        return "\u26a0\ufe0f Insira uma query PubMed.", None, gr.update(visible=False)
+        return "⚠️ Insira uma query PubMed.", None, gr.update(visible=False)
 
     try:
         result = run_pipeline(
@@ -97,11 +137,11 @@ def do_search(query: str, max_results: int, date_from: str, date_to: str):
             date_from=date_from.strip() or None,
             date_to=date_to.strip() or None,
             api_key=NCBI_API_KEY,
-            output_format="none",
+            output_format="none",   # no file output here
             verbose=False,
         )
     except Exception as exc:
-        return f"\u274c Erro: {exc}", None, gr.update(visible=False)
+        return f"❌ Erro: {exc}", None, gr.update(visible=False)
 
     records = result.get("records", [])
     if not records:
@@ -112,8 +152,8 @@ def do_search(query: str, max_results: int, date_from: str, date_to: str):
     _STATE["query"] = query
 
     status = (
-        f"\u2705 {result['summary'].get('total_articles', '?')} artigos \u00fanicos | "
-        f"{len(df)} pares autor \u00d7 artigo"
+        f"✅ {result['summary'].get('total_articles', '?')} artigos únicos | "
+        f"{len(df)} pares autor × artigo"
     )
     return status, df, gr.update(visible=True)
 
@@ -125,20 +165,20 @@ def do_search(query: str, max_results: int, date_from: str, date_to: str):
 def do_agent(target_txt: str):
     df = _STATE.get("df")
     if df is None or df.empty:
-        return "\u26a0\ufe0f Fa\u00e7a a busca primeiro.", None, gr.update(visible=False), ""
+        return "⚠️ Faça a busca primeiro.", None, gr.update(visible=False), ""
 
     targets = [c.strip() for c in target_txt.split(",") if c.strip()]
 
     try:
         result_df = run_agent(df, target_companies=targets or None)
     except Exception as exc:
-        return f"\u274c Erro no agente: {exc}", None, gr.update(visible=False), ""
+        return f"❌ Erro no agente: {exc}", None, gr.update(visible=False), ""
 
     _STATE["result_df"] = result_df
     summary = build_summary(result_df, targets or None)
     summary_md = _make_summary_md(summary, targets)
 
-    return "\u2705 An\u00e1lise conclu\u00edda!", result_df, gr.update(visible=True), summary_md
+    return "✅ Análise concluída!", result_df, gr.update(visible=True), summary_md
 
 
 def _make_summary_md(s: dict, targets: list) -> str:
@@ -148,25 +188,25 @@ def _make_summary_md(s: dict, targets: list) -> str:
     doubt_pct = round(100 * s.get("duvida", 0) / max(total, 1), 1)
 
     lines = [
-        "## \ud83d\udcca Resumo do Agente",
+        "## 📊 Resumo do Agente",
         "",
-        "| M\u00e9trica | Valor |",
+        "| Métrica | Valor |",
         "|---|---|",
         f"| Linhas analisadas | {total} |",
-        f"| Artigos \u00fanicos | {s.get('unique_articles', '-')} |",
-        f"| \u2705 CONFIRMADO | **{s.get('confirmado', 0)}** |",
-        f"| \u274c NEGADO | {s.get('negado', 0)} |",
-        f"| \u26a0\ufe0f D\u00daVIDA | {s.get('duvida', 0)} |",
+        f"| Artigos únicos | {s.get('unique_articles', '-')} |",
+        f"| ✅ CONFIRMADO | **{s.get('confirmado', 0)}** |",
+        f"| ❌ NEGADO | {s.get('negado', 0)} |",
+        f"| ⚠️ DÚVIDA | {s.get('duvida', 0)} |",
         "",
     ]
     companies = s.get("companies_found", [])
     if companies:
-        lines += ["### \ud83c\udfe2 Empresas detectadas", ", ".join(companies), ""]
+        lines += ["### 🏢 Empresas detectadas", ", ".join(companies), ""]
     if targets:
-        lines += ["### \ud83c\udfaf Empresas-alvo", ", ".join(targets), ""]
+        lines += ["### 🎯 Empresas-alvo", ", ".join(targets), ""]
     if doubt_pct > 0:
         lines.append(
-            f"> \u26a0\ufe0f {doubt_pct}% das linhas est\u00e3o como D\u00daVIDA \u2014 revisar manualmente."
+            f"> ⚠️ {doubt_pct}% das linhas estão como DÚVIDA — revisar manualmente."
         )
     return "\n".join(lines)
 
@@ -210,14 +250,14 @@ def build_ui() -> gr.Blocks:
 
         gr.HTML("""
         <div class="title">
-          <h1>\ud83d\udd2c Recoorpsearch</h1>
+          <h1>🔬 Recoorpsearch</h1>
           <p style="color:#6b7280;">
-            Busca PubMed \u00b7 Detec\u00e7\u00e3o de v\u00ednculos corporativos em afilia\u00e7\u00f5es de autores
+            Busca PubMed · Detecção de vínculos corporativos em afiliações de autores
           </p>
         </div>""")
 
         # ── Passo 1 ──────────────────────────────────────────────────────────
-        gr.Markdown("### \ud83d\udce1 Passo 1 \u2014 Busca no PubMed")
+        gr.Markdown("### 📡 Passo 1 — Busca no PubMed")
         with gr.Row():
             query_box = gr.Textbox(
                 label="Query PubMed",
@@ -225,52 +265,52 @@ def build_ui() -> gr.Blocks:
                 scale=4,
             )
             max_results_slider = gr.Slider(
-                label="M\u00e1x. artigos", minimum=10, maximum=500, step=10, value=100,
+                label="Máx. artigos", minimum=10, maximum=500, step=10, value=100,
                 scale=1,
             )
         with gr.Row():
-            date_from_box = gr.Textbox(label="Data in\u00edcio (AAAA ou AAAA/MM/DD)", placeholder="2020", scale=1)
+            date_from_box = gr.Textbox(label="Data início (AAAA ou AAAA/MM/DD)", placeholder="2020", scale=1)
             date_to_box   = gr.Textbox(label="Data fim",   placeholder="2024", scale=1)
 
         gr.Examples(examples=EXAMPLE_QUERIES, inputs=query_box, label="Exemplos")
 
-        search_btn    = gr.Button("\ud83d\udd0d Buscar Artigos", variant="primary")
+        search_btn    = gr.Button("🔍 Buscar Artigos", variant="primary")
         search_status = gr.Textbox(label="Status", interactive=False, lines=1)
         raw_table     = gr.Dataframe(label="Resultados Brutos", wrap=True, interactive=False, max_height=400)
-        export_raw_btn = gr.Button("\ud83d\udce5 Exportar tabela bruta (.xlsx)", visible=False)
+        export_raw_btn = gr.Button("📥 Exportar tabela bruta (.xlsx)", visible=False)
         raw_file       = gr.File(label="Download", visible=False)
 
         gr.HTML("<hr/>")
 
         # ── Passo 2 ──────────────────────────────────────────────────────────
-        gr.Markdown("### \ud83e\udd16 Passo 2 \u2014 Agente de An\u00e1lise de V\u00ednculos")
+        gr.Markdown("### 🤖 Passo 2 — Agente de Análise de Vínculos")
         gr.Markdown(
-            "O agente classifica cada par autor \u00d7 artigo como **\u2705 CONFIRMADO**, "
-            "**\u274c NEGADO** ou **\u26a0\ufe0f D\u00daVIDA**, relendo o contexto ao redor de nomes "
-            "amb\u00edguos antes de emitir o veredito. O resultado \u00e9 adicionado \u00e0 tabela "
-            "por *left join* no \u00edndice original."
+            "O agente classifica cada par autor × artigo como **✅ CONFIRMADO**, "
+            "**❌ NEGADO** ou **⚠️ DÚVIDA**, relendo o contexto ao redor de nomes "
+            "ambíguos antes de emitir o veredito. O resultado é adicionado à tabela "
+            "por *left join* no índice original."
         )
         target_box = gr.Textbox(
-            label="Empresas-alvo (opcional, separadas por v\u00edrgula)",
+            label="Empresas-alvo (opcional, separadas por vírgula)",
             placeholder="Pfizer, Novo Nordisk, Roche",
             info="Prioriza a busca por essas empresas no contexto de cada linha.",
         )
-        agent_btn    = gr.Button("\ud83e\udd16 Rodar Agente de Flags", variant="primary")
+        agent_btn    = gr.Button("🤖 Rodar Agente de Flags", variant="primary")
         agent_status = gr.Textbox(label="Status", interactive=False, lines=1)
         result_table = gr.Dataframe(
             label="Tabela com Veredito (left join)", wrap=True,
             interactive=False, max_height=500,
         )
         summary_out       = gr.Markdown()
-        export_verdict_btn = gr.Button("\ud83d\udce5 Exportar com veredito (.xlsx)", visible=False)
+        export_verdict_btn = gr.Button("📥 Exportar com veredito (.xlsx)", visible=False)
         verdict_file       = gr.File(label="Download", visible=False)
 
         gr.HTML("""
         <hr/>
         <p style="text-align:center;color:#9ca3af;font-size:.85rem;">
-          Recoorpsearch \u00b7 Dados: NCBI PubMed \u00b7
+          Recoorpsearch · Dados: NCBI PubMed ·
           <a href="https://www.ncbi.nlm.nih.gov/books/NBK25501/" target="_blank">
-            Documenta\u00e7\u00e3o E-utilities
+            Documentação E-utilities
           </a>
         </p>""")
 
